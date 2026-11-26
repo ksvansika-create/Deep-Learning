@@ -1,0 +1,354 @@
+
+# ============================================================
+# MODEL ARTEFACT LIFECYCLE
+# Architecture -> Checkpoint -> ONNX -> TensorRT
+# ============================================================
+
+# 1. INSTALL AND IMPORT LIBRARIES
+
+import sys
+import subprocess
+
+subprocess.check_call([
+    sys.executable, "-m", "pip", "install", "-q",
+    "onnx", "onnxruntime"
+])
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+import onnx
+import onnxruntime as ort
+import numpy as np
+import os
+import shutil
+
+print("=" * 60)
+print("MODEL ARTEFACT LIFECYCLE")
+print("=" * 60)
+
+# 2. CHECK DEVICE
+
+device = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+print("\nDevice:", device)
+
+if torch.cuda.is_available():
+    print("GPU:", torch.cuda.get_device_name(0))
+
+
+# 3. CREATE MODEL ARCHITECTURE
+
+print("\n1. MODEL ARCHITECTURE")
+
+class DigitModel(nn.Module):
+
+    def __init__(self):
+        super(DigitModel, self).__init__()
+
+        self.network = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(28 * 28, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 10)
+        )
+
+    def forward(self, x):
+        return self.network(x)
+
+
+model = DigitModel().to(device)
+
+print(model)
+print("Model architecture created successfully!")
+
+
+# 4. LOAD MNIST DATASET
+
+print("\n2. LOADING MNIST DATASET")
+
+transform = transforms.ToTensor()
+
+train_data = torchvision.datasets.MNIST(
+    root="./data",
+    train=True,
+    download=True,
+    transform=transform
+)
+
+test_data = torchvision.datasets.MNIST(
+    root="./data",
+    train=False,
+    download=True,
+    transform=transform
+)
+
+train_loader = torch.utils.data.DataLoader(
+    train_data,
+    batch_size=64,
+    shuffle=True
+)
+
+test_loader = torch.utils.data.DataLoader(
+    test_data,
+    batch_size=64,
+    shuffle=False
+)
+
+print("Training samples:", len(train_data))
+print("Testing samples:", len(test_data))
+
+
+# 5. TRAIN MODEL
+
+print("\n3. MODEL TRAINING")
+
+criterion = nn.CrossEntropyLoss()
+
+optimizer = optim.Adam(
+    model.parameters(),
+    lr=0.001
+)
+
+epochs = 2
+
+for epoch in range(epochs):
+
+    model.train()
+    total_loss = 0
+
+    for images, labels in train_loader:
+
+        images = images.to(device)
+        labels = labels.to(device)
+
+        outputs = model(images)
+
+        loss = criterion(outputs, labels)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    avg_loss = total_loss / len(train_loader)
+
+    print(
+        f"Epoch [{epoch+1}/{epochs}] "
+        f"Loss: {avg_loss:.4f}"
+    )
+
+print("Training completed!")
+
+
+# 6. TEST MODEL ACCURACY
+
+print("\n4. MODEL EVALUATION")
+
+model.eval()
+
+correct = 0
+total = 0
+
+with torch.no_grad():
+
+    for images, labels in test_loader:
+
+        images = images.to(device)
+        labels = labels.to(device)
+
+        outputs = model(images)
+
+        predictions = torch.argmax(outputs, dim=1)
+
+        total += labels.size(0)
+        correct += (predictions == labels).sum().item()
+
+accuracy = 100 * correct / total
+
+print("Total test images:", total)
+print("Correct predictions:", correct)
+print(f"Model accuracy: {accuracy:.2f}%")
+
+
+# 7. SAVE TRAINED CHECKPOINT
+
+print("\n5. SAVING TRAINED CHECKPOINT")
+
+torch.save(
+    {
+        "model_state_dict": model.state_dict(),
+        "epoch": epochs
+    },
+    "model_checkpoint.pth"
+)
+
+print("Checkpoint saved: model_checkpoint.pth")
+
+
+# 8. LOAD CHECKPOINT
+
+print("\n6. LOADING CHECKPOINT")
+
+checkpoint = torch.load(
+    "model_checkpoint.pth",
+    map_location=device,
+    weights_only=True
+)
+
+loaded_model = DigitModel().to(device)
+
+loaded_model.load_state_dict(
+    checkpoint["model_state_dict"]
+)
+
+loaded_model.eval()
+
+print("Checkpoint loaded successfully!")
+
+
+# 9. EXPORT MODEL TO ONNX
+
+print("\n7. EXPORTING MODEL TO ONNX")
+
+model_cpu = loaded_model.cpu()
+model_cpu.eval()
+
+dummy_input = torch.randn(1, 1, 28, 28)
+
+torch.onnx.export(
+    model_cpu,
+    dummy_input,
+    "model.onnx",
+    input_names=["input"],
+    output_names=["output"],
+    dynamic_axes={
+        "input": {0: "batch_size"},
+        "output": {0: "batch_size"}
+    },
+    opset_version=17,
+    dynamo=False
+)
+
+print("ONNX file created: model.onnx")
+
+
+# 10. VALIDATE ONNX MODEL
+
+print("\n8. VALIDATING ONNX MODEL")
+
+onnx_model = onnx.load("model.onnx")
+
+onnx.checker.check_model(onnx_model)
+
+print("ONNX model verified successfully!")
+
+
+# 11. ONNX INFERENCE
+
+print("\n9. ONNX INFERENCE")
+
+sample = torch.randn(1, 1, 28, 28)
+
+with torch.no_grad():
+    pytorch_output = model_cpu(sample).numpy()
+
+session = ort.InferenceSession(
+    "model.onnx",
+    providers=["CPUExecutionProvider"]
+)
+
+onnx_output = session.run(
+    ["output"],
+    {"input": sample.numpy()}
+)[0]
+
+pytorch_prediction = np.argmax(pytorch_output, axis=1)[0]
+onnx_prediction = np.argmax(onnx_output, axis=1)[0]
+
+print("PyTorch prediction:", pytorch_prediction)
+print("ONNX prediction:", onnx_prediction)
+
+difference = np.max(
+    np.abs(pytorch_output - onnx_output)
+)
+
+print("Maximum output difference:", difference)
+print("ONNX inference completed!")
+
+
+# 12. TENSORRT CONVERSION (OPTIONAL)
+
+print("\n10. TENSORRT ENGINE CONVERSION")
+
+trtexec = shutil.which("trtexec")
+
+if torch.cuda.is_available() and trtexec:
+
+    result = subprocess.run(
+        [
+            trtexec,
+            "--onnx=model.onnx",
+            "--saveEngine=model.engine"
+        ],
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode == 0 and os.path.exists("model.engine"):
+        print("TensorRT engine created successfully!")
+    else:
+        print("TensorRT conversion failed.")
+        print(result.stderr[-1500:])
+
+else:
+    print("TensorRT conversion skipped.")
+    print("A compatible NVIDIA GPU and TensorRT setup are required.")
+
+
+# 13. DISPLAY GENERATED FILES
+
+print("\n11. GENERATED MODEL ARTEFACTS")
+
+generated_files = [
+    "model_checkpoint.pth",
+    "model.onnx",
+    "model.engine"
+]
+
+for filename in generated_files:
+
+    if os.path.exists(filename):
+
+        size = os.path.getsize(filename) / 1024
+
+        print(f"{filename} - {size:.2f} KB")
+
+    else:
+
+        print(f"{filename} - Not generated")
+
+
+# 14. FINAL RESULT
+
+print("\n" + "=" * 60)
+print("MODEL ARTEFACT LIFECYCLE COMPLETED")
+print("=" * 60)
+
+print("1. Architecture created")
+print("2. Model trained")
+print("3. Checkpoint saved")
+print("4. ONNX graph exported")
+print("5. ONNX model validated")
+print("6. ONNX inference tested")
+print("7. TensorRT stage checked")
+
+print(f"\nFinal Model Accuracy: {accuracy:.2f}%")
+print("Practical execution finished!")
